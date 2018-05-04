@@ -22,6 +22,14 @@ include_directories(${VDAPP_INCLUDE_DIR})
 
 find_package(Threads)
 find_package(PkgConfig)
+find_package(X11 REQUIRED)
+
+pkg_check_modules(VDPAU vdpau)
+
+find_path(VDPAU_INCLUDE_DIR NAMES vdpau/vdpau.h vdpau/vdpau_x11.h PATHS ${VDPAU_INCLUDEDIR})
+find_library(VDPAU_LIBRARY NAMES vdpau PATHS ${VDPAU_LIBDIR})
+
+set(VDPAU_LIBRARIES ${VDPAU_LIBRARY})
 
 #fix output directories
 
@@ -36,5 +44,8 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fvisibility=hidden -fvisibility-inlines
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fvisibility=hidden")
 set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,--no-undefined -Wl,--exclude-libs,ALL")
 set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--no-undefined -Wl,--exclude-libs,ALL")
+
+include_directories(${X11_INCLUDE_DIR})
+include_directories(${VDPAU_INCLUDE_DIR})
 
 add_subdirectory(vdapp)
