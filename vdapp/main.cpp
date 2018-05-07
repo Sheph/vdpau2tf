@@ -26,6 +26,10 @@
 #include <vdpau/vdpau_x11.h>
 #include <malloc.h>
 
+#include <cuda.h>
+#include <cuda_runtime_api.h>
+#include <cuda_vdpau_interop.h>
+
 #undef Status
 
 static Display* dpy = NULL;
@@ -33,6 +37,7 @@ static Window win = 0;
 static GC gc = 0;
 
 static VdpOutputSurface output_surface;
+static cudaGraphicsResource* output_cuda_resource = NULL;
 static VdpVideoSurface video_surface;
 static VdpProcamp procamp;
 static VdpVideoMixer video_mixer;
@@ -244,6 +249,11 @@ static int createOutputSurface()
 
 	if (vdp_st != VDP_STATUS_OK)
 		return -1;
+
+	cudaError_t err = cudaGraphicsVDPAURegisterOutputSurface(&output_cuda_resource, output_surface, 0);
+	//if (err != cudaSuccess) {
+		//return -1;
+	//}
 
 	return 0;
 }

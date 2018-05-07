@@ -31,6 +31,7 @@ find_package(PkgConfig)
 find_package(X11 REQUIRED)
 find_package(Boost COMPONENTS system thread REQUIRED)
 find_package(OpenCV 3 REQUIRED)
+find_package(CUDA REQUIRED)
 
 pkg_check_modules(VDPAU vdpau)
 
