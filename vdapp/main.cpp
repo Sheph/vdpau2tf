@@ -255,27 +255,16 @@ static int putBits()
 	void* planes[3];
 	uint32_t pitches[3] = {vid_width, vid_width / 2, vid_width / 2};
 
-	planes[0] = calloc(vid_width * vid_height, sizeof(uint8_t));
-	planes[1] = calloc(vid_width * vid_height / 4, sizeof(uint8_t));
-	planes[2] = calloc(vid_width * vid_height / 4, sizeof(uint8_t));
+	cv::Mat frame = cv::imread("car.png");
+	cv::resize(frame, frame, cv::Size(vid_width, vid_height), 0, 0, cv::INTER_AREA);
+	cv::cvtColor(frame, frame, CV_BGR2YUV_YV12);
 
-	for (uint32_t y = 0; y < vid_height; ++y) {
-		for (uint32_t x = 0; x < vid_width; ++x) {
-			uint8_t* dy = (uint8_t*)planes[0];
-			uint8_t* dcr = (uint8_t*)planes[1];
-			uint8_t* dcb = (uint8_t*)planes[2];
-			dy[y * vid_height + x] = x + y;
-			dcb[(y * vid_height + x) / 4] = 90;
-			dcr[(y * vid_height + x) / 4] = 240;
-		}
-	}
+	planes[0] = frame.data;
+	planes[1] = frame.data + vid_width * vid_height;
+	planes[2] = frame.data + vid_width * vid_height + vid_width * vid_height / 4;
 
 	vdp_st = vdp_video_surface_put_bits_y_cb_cr(video_surface, VDP_YCBCR_FORMAT_YV12,
 		planes, pitches);
-
-	free(planes[0]);
-	free(planes[1]);
-	free(planes[2]);
 
 	if (vdp_st != VDP_STATUS_OK) {
 		printf("error = %d\n", (int)vdp_st);
@@ -478,10 +467,6 @@ int main(int argc, char* argv[])
 										NULL, NULL, 0, NULL);
 
 	cv::Mat frame = getBits();
-
-	frame = cv::imread("car.png");
-	cv::cvtColor(frame, frame, CV_BGR2BGRA);
-
 	feedTFFrame(frame);
 
 	int i = 1;
