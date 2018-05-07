@@ -1,3 +1,19 @@
+#include <tensorflow/core/framework/allocator.h>
+#include <tensorflow/core/public/session.h>
+#include <tensorflow/cc/ops/standard_ops.h>
+#include <tensorflow/core/framework/graph.pb.h>
+#include <tensorflow/core/graph/default_device.h>
+#include <tensorflow/core/graph/graph_def_builder.h>
+#include <tensorflow/core/lib/io/path.h>
+#include <tensorflow/core/grappler/devices.h>
+#include <tensorflow/core/common_runtime/gpu/gpu_init.h>
+#include <tensorflow/stream_executor/stream_executor_pimpl.h>
+
+#include <opencv2/imgcodecs.hpp>
+#include <opencv2/opencv.hpp>
+
+#include <boost/shared_ptr.hpp>
+
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <X11/XKBlib.h>
@@ -9,6 +25,8 @@
 #include <X11/extensions/xf86vmode.h>
 #include <vdpau/vdpau_x11.h>
 #include <malloc.h>
+
+#undef Status
 
 static Display* dpy = NULL;
 static Window win = 0;
@@ -237,9 +255,9 @@ static int putBits()
 	void* planes[3];
 	uint32_t pitches[3] = {vid_width, vid_width / 2, vid_width / 2};
 
-	planes[0] = calloc(vid_width * vid_height, sizeof(uint8_t*));
-	planes[1] = calloc(vid_width * vid_height / 4, sizeof(uint8_t*));
-	planes[2] = calloc(vid_width * vid_height / 4, sizeof(uint8_t*));
+	planes[0] = calloc(vid_width * vid_height, sizeof(uint8_t));
+	planes[1] = calloc(vid_width * vid_height / 4, sizeof(uint8_t));
+	planes[2] = calloc(vid_width * vid_height / 4, sizeof(uint8_t));
 
 	for (uint32_t y = 0; y < vid_height; ++y) {
 		for (uint32_t x = 0; x < vid_width; ++x) {
@@ -267,26 +285,141 @@ static int putBits()
 	return 0;
 }
 
-static int getBits()
+static cv::Mat getBits()
 {
-	uint32_t **data;
-	int i;
-	const uint32_t a[1] = {vid_width*4};
 	VdpStatus vdp_st;
 
-	data = (uint32_t * * )calloc(1, sizeof(uint32_t *));
+	void* planes[1];
+	uint32_t pitches[1] = {vid_width * 4};
 
-	for(i = 0; i < 1; i++)
-		data[i] = (uint32_t *)calloc(vid_width*vid_height, sizeof(uint32_t *));
+	cv::Mat data(vid_height, vid_width, CV_8UC4);
 
-	vdp_st = vdp_output_surface_get_bits_native(output_surface,NULL,
-												(void * const*)data,
-												 a);
+	planes[0] = data.data;
 
-	if (vdp_st != VDP_STATUS_OK)
-		return -1;
+	vdp_st = vdp_output_surface_get_bits_native(output_surface, NULL,
+		planes, pitches);
 
-	return 0;
+	if (vdp_st != VDP_STATUS_OK) {
+		return cv::Mat();
+	}
+
+	return data;
+}
+
+static boost::shared_ptr<tensorflow::Session> tf_session;
+
+static tensorflow::Status initTF(const std::string& graph_file, int device_id = -1)
+{
+	tensorflow::GraphDef graph_def;
+	TF_RETURN_IF_ERROR(tensorflow::ReadBinaryProto(
+		tensorflow::Env::Default(),
+		graph_file,
+		&graph_def));
+
+	if (device_id >= 0) {
+		std::stringstream ss;
+		ss << "/device:GPU:" << device_id;
+		tensorflow::graph::SetDefaultDevice(ss.str(), &graph_def);
+	}
+
+	tensorflow::SessionOptions opts;
+	opts.config.set_allow_soft_placement(true);
+	tf_session.reset(tensorflow::NewSession(opts));
+	TF_RETURN_IF_ERROR(tf_session->Create(graph_def));
+
+	return tensorflow::Status::OK();
+}
+
+const int net_input_w = 128;
+const int net_input_h = 72;
+const int net_grid_w = 16;
+const int net_grid_h = 9;
+
+struct Obj
+{
+	Obj() {}
+	Obj(int x, int y, float confidence)
+	: x(x), y(y), confidence(confidence) {}
+
+	int x;
+	int y;
+	float confidence;
+};
+
+static std::vector<Obj> getTFObjects(const tensorflow::Tensor& objectness_out_tensor, float threshold = 0.5f)
+{
+	const int nms_x = 1;
+	const int nms_y = 1;
+
+	std::vector<Obj> objs;
+
+	const float* objectness_out = objectness_out_tensor.Slice(0, 0).unaligned_flat<float>().data();
+	for (int y = 0; y < net_grid_h; ++y) {
+		for (int x = 0; x < net_grid_w; ++x) {
+			float bg_v = objectness_out[(net_grid_w * 2 * y + x * 2 + 0)];
+			float fg_v = objectness_out[(net_grid_w * 2 * y + x * 2 + 1)];
+			float confidence = std::exp(fg_v) / (std::exp(fg_v) + std::exp(bg_v));
+			if (confidence < threshold)
+				continue;
+			bool have_better = false;
+			for (int oy = y - nms_y; oy <= y + nms_y; ++oy) {
+				if (oy < 0)
+					continue;
+				if (oy >= net_grid_h)
+					continue;
+				if (have_better)
+					break;
+				for (int ox = x - nms_x; ox <= x + nms_x; ++ox) {
+					if (ox < 0)
+						continue;
+					if (ox >= net_grid_w)
+						continue;
+					float test_fg = objectness_out[(net_grid_w * 2 * oy + ox * 2 + 1)];
+					if (fg_v < test_fg)
+						have_better = true;
+				}
+			}
+			if (!have_better)
+				objs.push_back(Obj(x, y, confidence));
+		}
+	}
+
+	return objs;
+}
+
+static void feedTFFrame(const cv::Mat& bgra_frame)
+{
+	tensorflow::Tensor inp_tensor(tensorflow::DT_FLOAT,
+		tensorflow::TensorShape({1, net_input_h, net_input_w, 1}));
+
+	float* inp_data = inp_tensor.flat<float>().data();
+
+	cv::Mat frame;
+	cv::resize(bgra_frame, frame, cv::Size(net_input_w, net_input_h), 0, 0, cv::INTER_AREA);
+	cv::cvtColor(frame, frame, CV_BGRA2GRAY);
+
+	const uint8_t* src = frame.data;
+	for (int j = 0; j < net_input_h * net_input_w; ++j) {
+		*inp_data = *src / 255.0f;
+		++src;
+		++inp_data;
+	}
+
+	std::vector<tensorflow::Tensor> outputs;
+
+	tensorflow::Tensor is_training_tensor(tensorflow::DT_BOOL, tensorflow::TensorShape());
+	is_training_tensor.scalar<bool>()() = false;
+
+	auto status = tf_session->Run(
+		{{"Placeholder", is_training_tensor}, {"input", inp_tensor}},
+		{"net_objectness_out", "net_convlast_copy"}, {}, &outputs);
+	assert(status.ok());
+
+	auto objs = getTFObjects(outputs[0], 0.5f);
+
+	for (auto it = objs.begin(); it != objs.end(); ++it) {
+		printf("x:%d, y:%d, conf:%f\n", it->x, it->y, it->confidence);
+	}
 }
 
 int main(int argc, char* argv[])
@@ -327,6 +460,11 @@ int main(int argc, char* argv[])
 	if (status == -1)
 		printf("Error in initializing VdpPresentationQueue\n");
 
+	tensorflow::Status tf_status = initTF("car.pb");
+	if (tf_status != tensorflow::Status::OK()) {
+		printf("Error in initializing TF\n");
+	}
+
 	status = putBits();
 	if (status == -1)
 		printf("Error in Putting data on VdpVideoSurface\n");
@@ -339,8 +477,14 @@ int main(int argc, char* argv[])
 										output_surface,
 										NULL, NULL, 0, NULL);
 
-	getBits();
-	int i = 500;
+	cv::Mat frame = getBits();
+
+	frame = cv::imread("car.png");
+	cv::cvtColor(frame, frame, CV_BGR2BGRA);
+
+	feedTFFrame(frame);
+
+	int i = 1;
 	while (i) {
 	   vdp_presentation_queue_display(vdp_queue,
 											  output_surface,
