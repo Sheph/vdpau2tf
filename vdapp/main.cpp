@@ -1,4 +1,5 @@
 #include <tensorflow/core/framework/allocator.h>
+#include <tensorflow/core/framework/allocator_registry.h>
 #include <tensorflow/core/public/session.h>
 #include <tensorflow/cc/ops/standard_ops.h>
 #include <tensorflow/core/framework/graph.pb.h>
@@ -7,7 +8,11 @@
 #include <tensorflow/core/lib/io/path.h>
 #include <tensorflow/core/grappler/devices.h>
 #include <tensorflow/core/common_runtime/gpu/gpu_init.h>
+#include <tensorflow/core/common_runtime/direct_session.h>
+#include <tensorflow/core/common_runtime/gpu_device_context.h>
 #include <tensorflow/stream_executor/stream_executor_pimpl.h>
+#include <tensorflow/stream_executor/cuda/cuda_gpu_executor.h>
+#include <tensorflow/stream_executor/cuda/cuda_stream.h>
 
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/opencv.hpp>
@@ -27,17 +32,40 @@
 #include <malloc.h>
 
 #include <cuda.h>
-#include <cuda_runtime_api.h>
-#include <cuda_vdpau_interop.h>
+#include <cudaVDPAU.h>
 
 #undef Status
+
+tensorflow::AllocatorAttributes a;
+
+class VDPAUAllocator : public tensorflow::Allocator
+{
+public:
+	explicit VDPAUAllocator(int device_id, void* vdpau_ptr)
+	{
+		perftools::gputools::StreamExecutor* exec =
+			tensorflow::GPUMachineManager()->ExecutorForDevice(device_id).ValueOrDie();
+	}
+	virtual ~VDPAUAllocator() { }
+
+	tensorflow::string Name() override { return "vdpau"; }
+
+	void* AllocateRaw(size_t alignment, size_t num_bytes) override
+	{
+		return vdpau_ptr;
+	}
+
+	void DeallocateRaw(void* ptr) override { }
+
+private:
+	void* vdpau_ptr;
+};
 
 static Display* dpy = NULL;
 static Window win = 0;
 static GC gc = 0;
 
 static VdpOutputSurface output_surface;
-static cudaGraphicsResource* output_cuda_resource = NULL;
 static VdpVideoSurface video_surface;
 static VdpProcamp procamp;
 static VdpVideoMixer video_mixer;
@@ -250,7 +278,7 @@ static int createOutputSurface()
 	if (vdp_st != VDP_STATUS_OK)
 		return -1;
 
-	cudaError_t err = cudaGraphicsVDPAURegisterOutputSurface(&output_cuda_resource, output_surface, 0);
+	//cudaError_t err = cudaGraphicsVDPAURegisterOutputSurface(&output_cuda_resource, output_surface, 0);
 	//if (err != cudaSuccess) {
 		//return -1;
 	//}
@@ -306,6 +334,9 @@ static cv::Mat getBits()
 }
 
 static boost::shared_ptr<tensorflow::Session> tf_session;
+static CUdevice tf_cuda_device = 0;
+static CUcontext tf_cuda_ctx = NULL;
+static CUstream tf_cuda_stream = NULL;
 
 static tensorflow::Status initTF(const std::string& graph_file, int device_id = -1)
 {
@@ -326,7 +357,56 @@ static tensorflow::Status initTF(const std::string& graph_file, int device_id = 
 	tf_session.reset(tensorflow::NewSession(opts));
 	TF_RETURN_IF_ERROR(tf_session->Create(graph_def));
 
+	perftools::gputools::Platform* gpu_manager = tensorflow::GPUMachineManager();
+	perftools::gputools::StreamExecutor* se = gpu_manager->ExecutorForDevice(device_id).ValueOrDie();
+	perftools::gputools::internal::StreamExecutorInterface* sei	= se->implementation();
+	perftools::gputools::cuda::CUDAExecutor* cuda_executor = dynamic_cast<perftools::gputools::cuda::CUDAExecutor*>(sei);
+
+	assert(cuda_executor);
+
+	tensorflow::GPUDeviceContext* dev_ctx = NULL;
+
+	tensorflow::DirectSession* direct_session = dynamic_cast<tensorflow::DirectSession*>(tf_session.get());
+	const tensorflow::DeviceMgr* device_mgr = NULL;
+	direct_session->LocalDeviceManager(&device_mgr);
+	std::vector<tensorflow::Device*> devices = device_mgr->ListDevices();
+	for (auto it = devices.begin(); it != devices.end(); ++it) {
+		tensorflow::Device* dev = *it;
+		const tensorflow::DeviceBase::GpuDeviceInfo* info = dev->tensorflow_gpu_device_info();
+		if (info && (info->gpu_id == device_id)) {
+			// our nigger.
+			dev_ctx = dynamic_cast<tensorflow::GPUDeviceContext*>(info->default_context);
+			break;
+		}
+	}
+
+	assert(dev_ctx);
+
+	perftools::gputools::internal::StreamInterface* si	= dev_ctx->device_to_device_stream()->implementation();
+
+	perftools::gputools::cuda::CUDAStream* cuda_stream =
+		dynamic_cast<perftools::gputools::cuda::CUDAStream*>(si);
+
+	assert(cuda_stream);
+
+	tf_cuda_ctx = cuda_executor->cuda_context()->context();
+	tf_cuda_stream = cuda_stream->cuda_stream();
+
+	CUresult res = cuDeviceGet(&tf_cuda_device, device_id);
+	assert(res == CUDA_SUCCESS);
+
+	assert(tf_cuda_ctx);
+	assert(tf_cuda_stream);
+
 	return tensorflow::Status::OK();
+}
+
+static void initTFVDPAU()
+{
+	CUcontext vdpau_cuda_ctx = NULL;
+
+	CUresult res = cuVDPAUCtxCreate(&vdpau_cuda_ctx, 0, tf_cuda_device, vdp_device, vdp_get_proc_address);
+	assert(res == CUDA_SUCCESS);
 }
 
 const int net_input_w = 128;
@@ -388,6 +468,11 @@ static std::vector<Obj> getTFObjects(const tensorflow::Tensor& objectness_out_te
 
 static void feedTFFrame(const cv::Mat& bgra_frame)
 {
+	//boost::shared_ptr<VDPAUAllocator> allocator(new VDPAUAllocator(0));
+	//tensorflow::Tensor tmp(allocator.get(), tensorflow::DataType::DT_FLOAT, tensorflow::TensorShape({1, net_input_h, net_input_w, 1}));
+
+	//////
+
 	tensorflow::Tensor inp_tensor(tensorflow::DT_FLOAT,
 		tensorflow::TensorShape({1, net_input_h, net_input_w, 1}));
 
@@ -410,7 +495,7 @@ static void feedTFFrame(const cv::Mat& bgra_frame)
 	is_training_tensor.scalar<bool>()() = false;
 
 	auto status = tf_session->Run(
-		{{"Placeholder", is_training_tensor}, {"input", inp_tensor}},
+		{{"Placeholder", is_training_tensor}, {"input*0", inp_tensor}},
 		{"net_objectness_out", "net_convlast_copy"}, {}, &outputs);
 	assert(status.ok());
 
@@ -459,10 +544,12 @@ int main(int argc, char* argv[])
 	if (status == -1)
 		printf("Error in initializing VdpPresentationQueue\n");
 
-	tensorflow::Status tf_status = initTF("car.pb");
+	tensorflow::Status tf_status = initTF("car.pb", 0);
 	if (tf_status != tensorflow::Status::OK()) {
 		printf("Error in initializing TF\n");
 	}
+
+	initTFVDPAU();
 
 	status = putBits();
 	if (status == -1)

@@ -64,6 +64,7 @@ include_directories(${TF_DIR}/bazel-tensorflow/external/eigen_archive)
 include_directories(${TF_DIR}/bazel-tensorflow/external/nsync/public)
 include_directories(${TF_DIR}/bazel-tensorflow/external/protobuf_archive/src)
 include_directories(${OpenCV_INCLUDE_DIRS})
+include_directories(/usr/local)
 
 add_definitions(${Boost_LIB_DIAGNOSTIC_DEFINITIONS})
 
