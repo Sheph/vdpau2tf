@@ -278,11 +278,6 @@ static int createOutputSurface()
 	if (vdp_st != VDP_STATUS_OK)
 		return -1;
 
-	//cudaError_t err = cudaGraphicsVDPAURegisterOutputSurface(&output_cuda_resource, output_surface, 0);
-	//if (err != cudaSuccess) {
-		//return -1;
-	//}
-
 	return 0;
 }
 
