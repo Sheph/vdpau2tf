@@ -36,15 +36,12 @@
 
 #undef Status
 
-tensorflow::AllocatorAttributes a;
-
 class VDPAUAllocator : public tensorflow::Allocator
 {
 public:
-	explicit VDPAUAllocator(int device_id, void* vdpau_ptr)
+	explicit VDPAUAllocator(void* vdpau_ptr)
+	: vdpau_ptr(vdpau_ptr)
 	{
-		perftools::gputools::StreamExecutor* exec =
-			tensorflow::GPUMachineManager()->ExecutorForDevice(device_id).ValueOrDie();
 	}
 	virtual ~VDPAUAllocator() { }
 
@@ -60,6 +57,9 @@ public:
 private:
 	void* vdpau_ptr;
 };
+
+#define MY_VID_WIDTH 128
+#define MY_VID_HEIGHT 72
 
 static Display* dpy = NULL;
 static Window win = 0;
@@ -107,7 +107,7 @@ static void initX()
 	black = BlackPixel(dpy, DefaultScreen(dpy)),
 	white = WhitePixel(dpy, DefaultScreen(dpy));
 	win = XCreateSimpleWindow(dpy, DefaultRootWindow(dpy), 0, 0,
-			300, 300, 5, black, white);
+			MY_VID_WIDTH, MY_VID_HEIGHT, 5, black, white);
 	XSetStandardProperties(dpy, win, "VDPAU Test", "VDPAU",
 			None, NULL, 0, NULL);
 	XSelectInput(dpy, win, ExposureMask|ButtonPressMask|KeyPressMask);
@@ -333,12 +333,33 @@ static cv::Mat getBits()
 	return data;
 }
 
+static CUcontext vdpau_cuda_ctx = NULL;
+static CUgraphicsResource vdpau_cuda_resource = NULL;
+static CUdeviceptr vdpau_cuda_data = 0;
+
+static void initVDPAUCuda(int device_id)
+{
+	cuInit(0);
+
+	CUdevice cuda_device = 0;
+	CUresult res = cuDeviceGet(&cuda_device, device_id);
+	assert(res == CUDA_SUCCESS);
+
+	res = cuVDPAUCtxCreate(&vdpau_cuda_ctx, CU_CTX_MAP_HOST, cuda_device, vdp_device, vdp_get_proc_address);
+	assert(res == CUDA_SUCCESS);
+
+	res = cuGraphicsVDPAURegisterOutputSurface(&vdpau_cuda_resource, output_surface, CU_GRAPHICS_MAP_RESOURCE_FLAGS_READ_ONLY);
+	assert(res == CUDA_SUCCESS);
+
+	res = cuMemAlloc(&vdpau_cuda_data, vid_width * vid_height * 4);
+	assert(res == CUDA_SUCCESS);
+}
+
 static boost::shared_ptr<tensorflow::Session> tf_session;
-static CUdevice tf_cuda_device = 0;
 static CUcontext tf_cuda_ctx = NULL;
 static CUstream tf_cuda_stream = NULL;
 
-static tensorflow::Status initTF(const std::string& graph_file, int device_id = -1)
+static tensorflow::Status initTF(const std::string& graph_file, int device_id)
 {
 	tensorflow::GraphDef graph_def;
 	TF_RETURN_IF_ERROR(tensorflow::ReadBinaryProto(
@@ -382,7 +403,7 @@ static tensorflow::Status initTF(const std::string& graph_file, int device_id = 
 
 	assert(dev_ctx);
 
-	perftools::gputools::internal::StreamInterface* si	= dev_ctx->device_to_device_stream()->implementation();
+	perftools::gputools::internal::StreamInterface* si = dev_ctx->device_to_device_stream()->implementation();
 
 	perftools::gputools::cuda::CUDAStream* cuda_stream =
 		dynamic_cast<perftools::gputools::cuda::CUDAStream*>(si);
@@ -392,20 +413,51 @@ static tensorflow::Status initTF(const std::string& graph_file, int device_id = 
 	tf_cuda_ctx = cuda_executor->cuda_context()->context();
 	tf_cuda_stream = cuda_stream->cuda_stream();
 
-	CUresult res = cuDeviceGet(&tf_cuda_device, device_id);
-	assert(res == CUDA_SUCCESS);
-
 	assert(tf_cuda_ctx);
 	assert(tf_cuda_stream);
 
 	return tensorflow::Status::OK();
 }
 
-static void initTFVDPAU()
+static void* TFVDPAUmap()
 {
-	CUcontext vdpau_cuda_ctx = NULL;
+	CUgraphicsResource resources[1] = { vdpau_cuda_resource };
 
-	CUresult res = cuVDPAUCtxCreate(&vdpau_cuda_ctx, 0, tf_cuda_device, vdp_device, vdp_get_proc_address);
+	CUresult res = cuGraphicsMapResources(1, resources, tf_cuda_stream);
+	assert(res == CUDA_SUCCESS);
+
+	CUarray array = NULL;
+
+	res = cuGraphicsSubResourceGetMappedArray(&array, vdpau_cuda_resource, 0, 0);
+	assert(res == CUDA_SUCCESS);
+
+	CUDA_MEMCPY2D cpyinfo;
+
+	cpyinfo.srcMemoryType = CU_MEMORYTYPE_ARRAY;
+	cpyinfo.srcHost = 0;
+	cpyinfo.srcArray = array;
+	cpyinfo.srcXInBytes = 0;
+	cpyinfo.srcY = 0;
+	cpyinfo.srcPitch = vid_width * 4;
+	cpyinfo.dstMemoryType = CU_MEMORYTYPE_DEVICE;
+	cpyinfo.dstDevice = vdpau_cuda_data;
+	cpyinfo.dstXInBytes = 0;
+	cpyinfo.dstY = 0;
+	cpyinfo.dstPitch = vid_width * 4;
+	cpyinfo.WidthInBytes = vid_width * 4;
+	cpyinfo.Height = vid_height;
+
+	res = cuMemcpy2DAsync(&cpyinfo, tf_cuda_stream);
+	assert(res == CUDA_SUCCESS);
+
+	return (void*)vdpau_cuda_data;
+}
+
+static void TFVDPAUunmap()
+{
+	CUgraphicsResource resources[1] = { vdpau_cuda_resource };
+
+	CUresult res = cuGraphicsUnmapResources(1, resources, tf_cuda_stream);
 	assert(res == CUDA_SUCCESS);
 }
 
@@ -468,26 +520,15 @@ static std::vector<Obj> getTFObjects(const tensorflow::Tensor& objectness_out_te
 
 static void feedTFFrame(const cv::Mat& bgra_frame)
 {
-	//boost::shared_ptr<VDPAUAllocator> allocator(new VDPAUAllocator(0));
-	//tensorflow::Tensor tmp(allocator.get(), tensorflow::DataType::DT_FLOAT, tensorflow::TensorShape({1, net_input_h, net_input_w, 1}));
+	void* vdpau_ptr = TFVDPAUmap();
 
-	//////
+	boost::shared_ptr<VDPAUAllocator> allocator(new VDPAUAllocator(vdpau_ptr));
+	tensorflow::Tensor inp_tensor(allocator.get(), tensorflow::DataType::DT_UINT8, tensorflow::TensorShape({1, net_input_h, net_input_w, 4}));
 
-	tensorflow::Tensor inp_tensor(tensorflow::DT_FLOAT,
-		tensorflow::TensorShape({1, net_input_h, net_input_w, 1}));
-
-	float* inp_data = inp_tensor.flat<float>().data();
-
-	cv::Mat frame;
-	cv::resize(bgra_frame, frame, cv::Size(net_input_w, net_input_h), 0, 0, cv::INTER_AREA);
-	cv::cvtColor(frame, frame, CV_BGRA2GRAY);
-
-	const uint8_t* src = frame.data;
-	for (int j = 0; j < net_input_h * net_input_w; ++j) {
-		*inp_data = *src / 255.0f;
-		++src;
-		++inp_data;
-	}
+	/*tensorflow::Tensor inp_tensor(tensorflow::DT_UINT8,
+		tensorflow::TensorShape({1, net_input_h, net_input_w, 4}));
+	unsigned char* inp_data = inp_tensor.flat<unsigned char>().data();
+	memcpy(inp_data, bgra_frame.data, net_input_w * net_input_h * 4);*/
 
 	std::vector<tensorflow::Tensor> outputs;
 
@@ -504,6 +545,8 @@ static void feedTFFrame(const cv::Mat& bgra_frame)
 	for (auto it = objs.begin(); it != objs.end(); ++it) {
 		printf("x:%d, y:%d, conf:%f\n", it->x, it->y, it->confidence);
 	}
+
+	TFVDPAUunmap();
 }
 
 int main(int argc, char* argv[])
@@ -511,8 +554,8 @@ int main(int argc, char* argv[])
 	XEvent event;
 
 	vdp_chroma_type = VDP_CHROMA_TYPE_420;
-	vid_width = 300;
-	vid_height = 300;
+	vid_width = MY_VID_WIDTH;
+	vid_height = MY_VID_HEIGHT;
 	colorspace = 1;
 	VdpVideoMixerPictureStructure field = VDP_VIDEO_MIXER_PICTURE_STRUCTURE_FRAME;
 	procamp.struct_version = VDP_PROCAMP_VERSION;
@@ -544,12 +587,12 @@ int main(int argc, char* argv[])
 	if (status == -1)
 		printf("Error in initializing VdpPresentationQueue\n");
 
+	initVDPAUCuda(0);
+
 	tensorflow::Status tf_status = initTF("car.pb", 0);
 	if (tf_status != tensorflow::Status::OK()) {
 		printf("Error in initializing TF\n");
 	}
-
-	initTFVDPAU();
 
 	status = putBits();
 	if (status == -1)
@@ -564,6 +607,8 @@ int main(int argc, char* argv[])
 										NULL, NULL, 0, NULL);
 
 	cv::Mat frame = getBits();
+	feedTFFrame(frame);
+	feedTFFrame(frame);
 	feedTFFrame(frame);
 
 	int i = 1;
