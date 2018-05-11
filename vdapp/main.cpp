@@ -622,7 +622,7 @@ static void TFVDPAUmap()
 {
 	CUgraphicsResource resources[1] = { vdpau_cuda_resource };
 
-	CUresult res = cuGraphicsMapResources(1, resources, tf_cuda_stream);
+	CUresult res = cuGraphicsMapResources(1, resources, 0);
 	assert(res == CUDA_SUCCESS);
 
 	res = cuGraphicsSubResourceGetMappedArray(&array, vdpau_cuda_resource, 0, 0);
@@ -633,7 +633,7 @@ static void TFVDPAUunmap()
 {
 	CUgraphicsResource resources[1] = { vdpau_cuda_resource };
 
-	CUresult res = cuGraphicsUnmapResources(1, resources, tf_cuda_stream);
+	CUresult res = cuGraphicsUnmapResources(1, resources, 0);
 	assert(res == CUDA_SUCCESS);
 }
 
@@ -710,6 +710,8 @@ static void feedTFFrame(const cv::Mat& bgra_frame)
 	tensorflow::Tensor* inp_tensor = NULL;
 
 	if (tf_mode == 2) {
+		TFVDPAUmap();
+
 		CUDA_MEMCPY2D cpyinfo;
 
 		cpyinfo.srcMemoryType = CU_MEMORYTYPE_ARRAY;
@@ -728,6 +730,8 @@ static void feedTFFrame(const cv::Mat& bgra_frame)
 
 		CUresult res = cuMemcpy2DAsync(&cpyinfo, tf_cuda_stream);
 		assert(res == CUDA_SUCCESS);
+
+		TFVDPAUunmap();
 
 		inp_tensor = &cuda_inp_tensor;
 	} else {
@@ -822,8 +826,6 @@ int main(int argc, char* argv[])
 	cv::Mat tmp_mat;
 
 	if (tf_mode == 2) {
-		TFVDPAUmap();
-
 		boost::shared_ptr<VDPAUAllocator> allocator(new VDPAUAllocator((void*)vdpau_cuda_data));
 		cuda_inp_tensor = tensorflow::Tensor(allocator.get(), tensorflow::DataType::DT_UINT8, tensorflow::TensorShape({1, net_input_h, net_input_w, 4}));
 		tensor_name = "input*0";
@@ -856,10 +858,6 @@ int main(int argc, char* argv[])
 	printf("DONE %f fps!\n", (float)(num_frames / tm));
 
 	fflush(stdout);
-
-	if (tf_mode == 2) {
-		TFVDPAUunmap();
-	}
 
 	cleanupX();
 
