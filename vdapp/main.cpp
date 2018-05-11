@@ -853,6 +853,8 @@ int main(int argc, char* argv[])
 
 	printf("DONE %f fps!\n", (float)(num_frames / tm));
 
+	fflush(stdout);
+
 	if (tf_mode == 2) {
 		TFVDPAUunmap();
 	}
