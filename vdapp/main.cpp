@@ -109,6 +109,7 @@ static VdpPresentationQueueCreate *vdp_presentation_queue_create;
 static VdpPresentationQueueDestroy *vdp_presentation_queue_destroy;
 static VdpPresentationQueueDisplay *vdp_presentation_queue_display;
 static VdpPresentationQueueTargetCreateX11 *vdp_presentation_queue_target_create_x11;
+static VdpPresentationQueueBlockUntilSurfaceIdle *vdp_presentation_queue_block_until_surface_idle;
 static VdpDecoderCreate *vdp_decoder_create;
 static VdpDecoderDestroy *vdp_decoder_destroy;
 static VdpDecoderRender *vdp_decoder_render;
@@ -375,6 +376,7 @@ static int initVDPAU()
 		{VDP_FUNC_ID_PRESENTATION_QUEUE_DISPLAY,        &vdp_presentation_queue_display},
 		{VDP_FUNC_ID_PRESENTATION_QUEUE_TARGET_CREATE_X11,
 			&vdp_presentation_queue_target_create_x11},
+		{VDP_FUNC_ID_PRESENTATION_QUEUE_BLOCK_UNTIL_SURFACE_IDLE, &vdp_presentation_queue_block_until_surface_idle},
 		{VDP_FUNC_ID_DECODER_CREATE,                    &vdp_decoder_create},
 		{VDP_FUNC_ID_DECODER_RENDER,                    &vdp_decoder_render},
 		{VDP_FUNC_ID_DECODER_DESTROY,                   &vdp_decoder_destroy},
@@ -749,7 +751,7 @@ static void feedTFFrame(const cv::Mat& bgra_frame)
 		auto objs = getTFObjects(outputs[0], 0.5f);
 
 		for (auto it = objs.begin(); it != objs.end(); ++it) {
-			printf("x:%d, y:%d, conf:%f\n", it->x, it->y, it->confidence);
+			printf("x:%d, y:%d, conf:%.4f\n", it->x, it->y, it->confidence);
 		}
 	}
 }
