@@ -34,6 +34,9 @@ find_package(OpenCV 3 REQUIRED)
 find_package(CUDA REQUIRED)
 
 pkg_check_modules(VDPAU vdpau)
+pkg_check_modules(AVCODEC libavcodec)
+pkg_check_modules(AVFORMAT libavformat)
+pkg_check_modules(AVUTIL libavutil)
 
 find_path(VDPAU_INCLUDE_DIR NAMES vdpau/vdpau.h vdpau/vdpau_x11.h PATHS ${VDPAU_INCLUDEDIR})
 find_library(VDPAU_LIBRARY NAMES vdpau PATHS ${VDPAU_LIBDIR})
@@ -48,8 +51,8 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${VDAPP_OUT_DIR}/lib)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${VDAPP_OUT_DIR}/bin)
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${VDAPP_OUT_DIR}/lib)
 
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -D_REENTRANT -fPIC -DPIC")
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -D_REENTRANT -fPIC -DPIC -std=c++11")
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wno-deprecated-declarations -D_REENTRANT -fPIC -DPIC")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wno-deprecated-declarations -D_REENTRANT -fPIC -DPIC -std=c++11")
 
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fvisibility=hidden -fvisibility-inlines-hidden")
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fvisibility=hidden")
