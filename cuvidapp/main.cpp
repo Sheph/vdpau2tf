@@ -62,6 +62,8 @@ static const int net_input_h = 72;
 static const int net_grid_w = 16;
 static const int net_grid_h = 9;
 
+static const int net_batch_size = 10;
+
 static const char * GetVideoCodecString(cudaVideoCodec eCodec) {
 	static struct {
 		cudaVideoCodec eCodec;
@@ -147,6 +149,17 @@ static unsigned long GetNumDecodeSurfaces(cudaVideoCodec eCodec, unsigned int nW
 
 simplelogger::Logger *logger = simplelogger::LoggerFactory::CreateConsoleLogger();
 
+struct VideoBuffer
+{
+	VideoBuffer() {}
+	explicit VideoBuffer(CUVIDPARSERDISPINFO* disp_info)
+	: disp_info(disp_info) {}
+
+	CUVIDPARSERDISPINFO* disp_info;
+	CUdeviceptr frame;
+	unsigned int pitch;
+};
+
 class VideoDecoder
 {
 public:
@@ -182,9 +195,9 @@ public:
 		thr_.join();
 	}
 
-	CUdeviceptr get_next_frame(CUstream stream, unsigned int& pitch)
+	void get_frames(CUstream stream, std::vector<VideoBuffer>& buffers)
 	{
-		CUVIDPARSERDISPINFO* disp_info = NULL;
+		buffers.clear();
 
 		{
 			boost::mutex::scoped_lock lock(mtx_);
@@ -192,37 +205,42 @@ public:
 				cond_.wait(lock);
 			}
 			if (done_) {
-				return 0;
+				return;
 			}
-			disp_info = frame_queue_.front();
+
+			for (auto it = frame_queue_.begin(); (it != frame_queue_.end()) && (static_cast<int>(buffers.size()) < net_batch_size); ++it) {
+				buffers.push_back(VideoBuffer(*it));
+			}
 		}
 
-		CUVIDPROCPARAMS videoProcessingParameters = {};
-		videoProcessingParameters.progressive_frame = disp_info->progressive_frame;
-		videoProcessingParameters.second_field = disp_info->repeat_first_field + 1;
-		videoProcessingParameters.top_field_first = disp_info->top_field_first;
-		videoProcessingParameters.unpaired_field = disp_info->repeat_first_field < 0;
-		videoProcessingParameters.output_stream = stream;
+		for (auto it = buffers.begin(); it != buffers.end(); ++it) {
+			CUVIDPARSERDISPINFO* disp_info = it->disp_info;
 
-		CUdeviceptr frame = 0;
+			CUVIDPROCPARAMS videoProcessingParameters = {};
+			videoProcessingParameters.progressive_frame = disp_info->progressive_frame;
+			videoProcessingParameters.second_field = disp_info->repeat_first_field + 1;
+			videoProcessingParameters.top_field_first = disp_info->top_field_first;
+			videoProcessingParameters.unpaired_field = disp_info->repeat_first_field < 0;
+			videoProcessingParameters.output_stream = stream;
 
-		CUresult res = cuvidMapVideoFrame(decoder_, disp_info->picture_index, &frame,
-			&pitch, &videoProcessingParameters);
-		MY_CHECK(res == CUDA_SUCCESS);
-
-		return frame;
+			CUresult res = cuvidMapVideoFrame(decoder_, disp_info->picture_index, &it->frame,
+				&it->pitch, &videoProcessingParameters);
+			MY_CHECK(res == CUDA_SUCCESS);
+		}
 	}
 
-	void finish_frame(CUdeviceptr frame)
+	void finish_frames(const std::vector<VideoBuffer>& buffers)
 	{
-		CUresult res = cuvidUnmapVideoFrame(decoder_, frame);
-		MY_CHECK(res == CUDA_SUCCESS);
-
-		{
-			boost::mutex::scoped_lock lock(mtx_);
-			frame_queue_.pop_front();
-			cond_.notify_all();
+		for (auto it = buffers.begin(); it != buffers.end(); ++it) {
+			CUresult res = cuvidUnmapVideoFrame(decoder_, it->frame);
+			MY_CHECK(res == CUDA_SUCCESS);
 		}
+
+		boost::mutex::scoped_lock lock(mtx_);
+		for (auto it = buffers.begin(); it != buffers.end(); ++it) {
+			frame_queue_.pop_front();
+		}
+		cond_.notify_all();
 	}
 
 	cv::Mat device_frame_to_mat(CUdeviceptr frame, unsigned int pitch, CUstream stream)
@@ -346,7 +364,7 @@ private:
 		videoDecodeCreateInfo.OutputFormat = pVideoFormat->bit_depth_luma_minus8 ? cudaVideoSurfaceFormat_P016 : cudaVideoSurfaceFormat_NV12;
 		videoDecodeCreateInfo.bitDepthMinus8 = pVideoFormat->bit_depth_luma_minus8;
 		videoDecodeCreateInfo.DeinterlaceMode = cudaVideoDeinterlaceMode_Weave;
-		videoDecodeCreateInfo.ulNumOutputSurfaces = 2;
+		videoDecodeCreateInfo.ulNumOutputSurfaces = net_batch_size;
 		// With PreferCUVID, JPEG is still decoded by CUDA while video is decoded by NVDEC hardware
 		videoDecodeCreateInfo.ulCreationFlags = cudaVideoCreate_PreferCUVID;
 		videoDecodeCreateInfo.ulNumDecodeSurfaces = this_->max_decode_surfaces_;
@@ -526,41 +544,43 @@ struct Obj
 	float confidence;
 };
 
-static std::vector<Obj> getTFObjects(const tensorflow::Tensor& objectness_out_tensor, float threshold = 0.5f)
+static std::vector<Obj> getTFObjects(int N, const tensorflow::Tensor& objectness_out_tensor, float threshold = 0.5f)
 {
 	const int nms_x = 1;
 	const int nms_y = 1;
 
 	std::vector<Obj> objs;
 
-	const float* objectness_out = objectness_out_tensor.Slice(0, 0).unaligned_flat<float>().data();
-	for (int y = 0; y < net_grid_h; ++y) {
-		for (int x = 0; x < net_grid_w; ++x) {
-			float bg_v = objectness_out[(net_grid_w * 2 * y + x * 2 + 0)];
-			float fg_v = objectness_out[(net_grid_w * 2 * y + x * 2 + 1)];
-			float confidence = std::exp(fg_v) / (std::exp(fg_v) + std::exp(bg_v));
-			if (confidence < threshold)
-				continue;
-			bool have_better = false;
-			for (int oy = y - nms_y; oy <= y + nms_y; ++oy) {
-				if (oy < 0)
+	for (int batch_i = 0; batch_i < N; ++batch_i) {
+		const float* objectness_out = objectness_out_tensor.Slice(batch_i, batch_i).unaligned_flat<float>().data();
+		for (int y = 0; y < net_grid_h; ++y) {
+			for (int x = 0; x < net_grid_w; ++x) {
+				float bg_v = objectness_out[(net_grid_w * 2 * y + x * 2 + 0)];
+				float fg_v = objectness_out[(net_grid_w * 2 * y + x * 2 + 1)];
+				float confidence = std::exp(fg_v) / (std::exp(fg_v) + std::exp(bg_v));
+				if ((confidence < threshold) || (bg_v == 1.0f))
 					continue;
-				if (oy >= net_grid_h)
-					continue;
-				if (have_better)
-					break;
-				for (int ox = x - nms_x; ox <= x + nms_x; ++ox) {
-					if (ox < 0)
+				bool have_better = false;
+				for (int oy = y - nms_y; oy <= y + nms_y; ++oy) {
+					if (oy < 0)
 						continue;
-					if (ox >= net_grid_w)
+					if (oy >= net_grid_h)
 						continue;
-					float test_fg = objectness_out[(net_grid_w * 2 * oy + ox * 2 + 1)];
-					if (fg_v < test_fg)
-						have_better = true;
+					if (have_better)
+						break;
+					for (int ox = x - nms_x; ox <= x + nms_x; ++ox) {
+						if (ox < 0)
+							continue;
+						if (ox >= net_grid_w)
+							continue;
+						float test_fg = objectness_out[(net_grid_w * 2 * oy + ox * 2 + 1)];
+						if (fg_v < test_fg)
+							have_better = true;
+					}
 				}
+				if (!have_better)
+					objs.push_back(Obj(x, y, confidence));
 			}
-			if (!have_better)
-				objs.push_back(Obj(x, y, confidence));
 		}
 	}
 
@@ -574,33 +594,21 @@ tensorflow::Tensor cuda_inp_tensor;
 
 std::string tensor_name;
 
-tensorflow::Tensor tmp_inp_tensor;
-
-static void feedTFFrame(const cv::Mat& gray_frame)
+static void feedTFFrame(const tensorflow::Tensor& tensor)
 {
-	tensorflow::Tensor* inp_tensor = NULL;
-
-	if (mode == ModeDirect) {
-		inp_tensor = &cuda_inp_tensor;
-	} else {
-		tmp_inp_tensor = tensorflow::Tensor(tensorflow::DT_UINT8,
-			tensorflow::TensorShape({1, net_input_h, net_input_w, 1}));
-		unsigned char* inp_data = tmp_inp_tensor.flat<unsigned char>().data();
-		memcpy(inp_data, gray_frame.data, net_input_w * net_input_h);
-		inp_tensor = &tmp_inp_tensor;
-	}
+	int N = tensor.dim_size(0);
 
 	std::vector<tensorflow::Tensor> outputs;
 
 	is_training_tensor.scalar<bool>()() = false;
 
 	auto status = tf_session->Run(
-		{{"Placeholder", is_training_tensor}, {tensor_name, *inp_tensor}},
+		{{"Placeholder", is_training_tensor}, {tensor_name, tensor}},
 		{"net_objectness_out"}, {}, &outputs);
 	assert(status.ok());
 
 	if (dpy) {
-		auto objs = getTFObjects(outputs[0], 0.5f);
+		auto objs = getTFObjects(N, outputs[0], 0.5f);
 
 		for (auto it = objs.begin(); it != objs.end(); ++it) {
 			printf("x:%d, y:%d, conf:%.4f\n", it->x, it->y, it->confidence);
@@ -637,7 +645,7 @@ int main(int argc, char* argv[])
 
 	int num_frames = 0;
 
-	cv::Mat tmp_mat, gray;
+	cv::Mat gray;
 
 	if (mode == ModeDirect) {
 		cuda_inp_allocator.reset(new CUVIDAllocator());
@@ -646,55 +654,66 @@ int main(int argc, char* argv[])
 		tensor_name = "input";
 	}
 
-	CUdeviceptr frame = 0;
-	unsigned int pitch = 0;
+	std::vector<VideoBuffer> buffers;
 
 	CUstream stream = 0;
 
-	CUdeviceptr frame_cpy = 0;
+	CUdeviceptr batch = 0;
 
 	if (mode == ModeDirect) {
 		stream = tf_cuda_stream;
 
-		res = cuMemAlloc(&frame_cpy, net_input_w * net_input_h);
+		res = cuMemAlloc(&batch, net_input_w * net_input_h * net_batch_size);
 		assert(res == CUDA_SUCCESS);
 	}
 
-	while ((frame = decoder.get_next_frame(stream, pitch))) {
+	while (true) {
+		decoder.get_frames(stream, buffers);
+		if (buffers.empty()) {
+			break;
+		}
 		if (mode == ModeDirect) {
-			CUDA_MEMCPY2D m = { 0 };
-			m.srcMemoryType = CU_MEMORYTYPE_DEVICE;
-			m.srcDevice = frame;
-			m.srcPitch = pitch;
-			m.dstMemoryType = CU_MEMORYTYPE_DEVICE;
-			m.dstDevice = (CUdeviceptr)(m.dstHost = (void*)frame_cpy);
-			m.dstPitch = net_input_w;
-			m.WidthInBytes = net_input_w;
-			m.Height = net_input_h;
-			res = cuMemcpy2DAsync(&m, stream);
-			MY_CHECK(res == CUDA_SUCCESS);
-			cuda_inp_allocator->setPtr((void*)frame_cpy);
-			cuda_inp_tensor = tensorflow::Tensor(cuda_inp_allocator.get(), tensorflow::DataType::DT_UINT8, tensorflow::TensorShape({1, net_input_h, net_input_w, 1}));
-			feedTFFrame(tmp_mat);
+			for (size_t i = 0; i < buffers.size(); ++i) {
+				CUDA_MEMCPY2D m = { 0 };
+				m.srcMemoryType = CU_MEMORYTYPE_DEVICE;
+				m.srcDevice = buffers[i].frame;
+				m.srcPitch = buffers[i].pitch;
+				m.dstMemoryType = CU_MEMORYTYPE_DEVICE;
+				m.dstDevice = (CUdeviceptr)(m.dstHost = (char*)batch + net_input_w * net_input_h * i);
+				m.dstPitch = net_input_w;
+				m.WidthInBytes = net_input_w;
+				m.Height = net_input_h;
+				res = cuMemcpy2DAsync(&m, stream);
+				MY_CHECK(res == CUDA_SUCCESS);
+			}
+			cuda_inp_allocator->setPtr((void*)batch);
+			cuda_inp_tensor = tensorflow::Tensor(cuda_inp_allocator.get(), tensorflow::DataType::DT_UINT8, tensorflow::TensorShape({static_cast<int>(buffers.size()), net_input_h, net_input_w, 1}));
+			feedTFFrame(cuda_inp_tensor);
 			if (dpy) {
-				gray = decoder.device_frame_to_mat(frame, pitch, stream);
+				gray = decoder.device_frame_to_mat(buffers[0].frame, buffers[0].pitch, stream);
 				cv::imshow("frame", gray);
 				cv::waitKey(1);
 			}
 		} else if (mode == ModeReadback) {
-			gray = decoder.device_frame_to_mat(frame, pitch, stream);
-			feedTFFrame(gray);
+			tensorflow::Tensor batch_tensor(tensorflow::DT_UINT8,
+				tensorflow::TensorShape({static_cast<int>(buffers.size()), net_input_h, net_input_w, 1}));
+			unsigned char* inp_data = batch_tensor.flat<unsigned char>().data();
+			for (size_t i = 0; i < buffers.size(); ++i) {
+				gray = decoder.device_frame_to_mat(buffers[i].frame, buffers[i].pitch, stream);
+				memcpy(inp_data + net_input_w * net_input_h * i, gray.data, net_input_w * net_input_h);
+			}
+			feedTFFrame(batch_tensor);
 			if (dpy) {
 				cv::imshow("frame", gray);
 				cv::waitKey(1);
 			}
 		} else if (dpy) {
-			gray = decoder.device_frame_to_mat(frame, pitch, stream);
+			gray = decoder.device_frame_to_mat(buffers[0].frame, buffers[0].pitch, stream);
 			cv::imshow("frame", gray);
 			cv::waitKey(1);
 		}
-		decoder.finish_frame(frame);
-		++num_frames;
+		decoder.finish_frames(buffers);
+		num_frames += static_cast<int>(buffers.size());
 	}
 
 	struct timeval tv2, tv_res;
