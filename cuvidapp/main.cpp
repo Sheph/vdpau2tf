@@ -44,7 +44,16 @@ extern void __assert_fail (const char *__assertion, const char *__file,
 
 #define MY_CHECK(expr) if (!(expr)) __assert_fail(__STRING(expr), __FILE__, __LINE__, __PRETTY_FUNCTION__)
 
+enum Mode
+{
+	ModeNoop = 0,
+	ModeReadback = 1,
+	ModeDirect = 2
+};
+
 static int gpu_id = -1;
+static Mode mode = ModeNoop;
+static bool dpy = false;
 static CUdevice cuda_device = 0;
 static CUcontext cuda_ctx = NULL;
 
@@ -419,14 +428,196 @@ private:
 	bool done_;
 };
 
+class CUVIDAllocator : public tensorflow::Allocator
+{
+public:
+	explicit CUVIDAllocator()
+	: ptr(NULL)
+	{
+	}
+	virtual ~CUVIDAllocator() { }
+
+	tensorflow::string Name() override { return "cuvid"; }
+
+	void* AllocateRaw(size_t alignment, size_t num_bytes) override
+	{
+		return ptr;
+	}
+
+	void DeallocateRaw(void* ptr) override { }
+
+	void setPtr(void* value) { ptr = value; }
+
+private:
+	void* ptr;
+};
+
+static boost::shared_ptr<tensorflow::Session> tf_session;
+static CUstream tf_cuda_stream = NULL;
+
+static tensorflow::Status initTF(const std::string& graph_file, int device_id)
+{
+	tensorflow::GraphDef graph_def;
+	TF_RETURN_IF_ERROR(tensorflow::ReadBinaryProto(
+		tensorflow::Env::Default(),
+		graph_file,
+		&graph_def));
+
+	if (device_id >= 0) {
+		std::stringstream ss;
+		ss << "/device:GPU:" << device_id;
+		tensorflow::graph::SetDefaultDevice(ss.str(), &graph_def);
+	}
+
+	tensorflow::SessionOptions opts;
+	opts.config.set_allow_soft_placement(true);
+	tf_session.reset(tensorflow::NewSession(opts));
+	TF_RETURN_IF_ERROR(tf_session->Create(graph_def));
+
+	perftools::gputools::Platform* gpu_manager = tensorflow::GPUMachineManager();
+	perftools::gputools::StreamExecutor* se = gpu_manager->ExecutorForDevice(device_id).ValueOrDie();
+	perftools::gputools::internal::StreamExecutorInterface* sei	= se->implementation();
+	perftools::gputools::cuda::CUDAExecutor* cuda_executor = dynamic_cast<perftools::gputools::cuda::CUDAExecutor*>(sei);
+
+	MY_CHECK(cuda_executor);
+
+	tensorflow::GPUDeviceContext* dev_ctx = NULL;
+
+	tensorflow::DirectSession* direct_session = dynamic_cast<tensorflow::DirectSession*>(tf_session.get());
+	const tensorflow::DeviceMgr* device_mgr = NULL;
+	direct_session->LocalDeviceManager(&device_mgr);
+	std::vector<tensorflow::Device*> devices = device_mgr->ListDevices();
+	for (auto it = devices.begin(); it != devices.end(); ++it) {
+		tensorflow::Device* dev = *it;
+		const tensorflow::DeviceBase::GpuDeviceInfo* info = dev->tensorflow_gpu_device_info();
+		if (info && (info->gpu_id == device_id)) {
+			// our nigger.
+			dev_ctx = dynamic_cast<tensorflow::GPUDeviceContext*>(info->default_context);
+			break;
+		}
+	}
+
+	MY_CHECK(dev_ctx);
+
+	perftools::gputools::internal::StreamInterface* si = dev_ctx->device_to_device_stream()->implementation();
+
+	perftools::gputools::cuda::CUDAStream* cuda_stream =
+		dynamic_cast<perftools::gputools::cuda::CUDAStream*>(si);
+
+	MY_CHECK(cuda_stream);
+
+	//tf_cuda_ctx = cuda_executor->cuda_context()->context();
+	tf_cuda_stream = cuda_stream->cuda_stream();
+
+	//assert(tf_cuda_ctx);
+	MY_CHECK(tf_cuda_stream);
+
+	return tensorflow::Status::OK();
+}
+
+struct Obj
+{
+	Obj() {}
+	Obj(int x, int y, float confidence)
+	: x(x), y(y), confidence(confidence) {}
+
+	int x;
+	int y;
+	float confidence;
+};
+
+static std::vector<Obj> getTFObjects(const tensorflow::Tensor& objectness_out_tensor, float threshold = 0.5f)
+{
+	const int nms_x = 1;
+	const int nms_y = 1;
+
+	std::vector<Obj> objs;
+
+	const float* objectness_out = objectness_out_tensor.Slice(0, 0).unaligned_flat<float>().data();
+	for (int y = 0; y < net_grid_h; ++y) {
+		for (int x = 0; x < net_grid_w; ++x) {
+			float bg_v = objectness_out[(net_grid_w * 2 * y + x * 2 + 0)];
+			float fg_v = objectness_out[(net_grid_w * 2 * y + x * 2 + 1)];
+			float confidence = std::exp(fg_v) / (std::exp(fg_v) + std::exp(bg_v));
+			if (confidence < threshold)
+				continue;
+			bool have_better = false;
+			for (int oy = y - nms_y; oy <= y + nms_y; ++oy) {
+				if (oy < 0)
+					continue;
+				if (oy >= net_grid_h)
+					continue;
+				if (have_better)
+					break;
+				for (int ox = x - nms_x; ox <= x + nms_x; ++ox) {
+					if (ox < 0)
+						continue;
+					if (ox >= net_grid_w)
+						continue;
+					float test_fg = objectness_out[(net_grid_w * 2 * oy + ox * 2 + 1)];
+					if (fg_v < test_fg)
+						have_better = true;
+				}
+			}
+			if (!have_better)
+				objs.push_back(Obj(x, y, confidence));
+		}
+	}
+
+	return objs;
+}
+
+tensorflow::Tensor is_training_tensor(tensorflow::DT_BOOL, tensorflow::TensorShape());
+
+boost::shared_ptr<CUVIDAllocator> cuda_inp_allocator;
+tensorflow::Tensor cuda_inp_tensor;
+
+std::string tensor_name;
+
+tensorflow::Tensor tmp_inp_tensor;
+
+static void feedTFFrame(const cv::Mat& gray_frame)
+{
+	tensorflow::Tensor* inp_tensor = NULL;
+
+	if (mode == ModeDirect) {
+		inp_tensor = &cuda_inp_tensor;
+	} else {
+		tmp_inp_tensor = tensorflow::Tensor(tensorflow::DT_UINT8,
+			tensorflow::TensorShape({1, net_input_h, net_input_w, 1}));
+		unsigned char* inp_data = tmp_inp_tensor.flat<unsigned char>().data();
+		memcpy(inp_data, gray_frame.data, net_input_w * net_input_h);
+		inp_tensor = &tmp_inp_tensor;
+	}
+
+	std::vector<tensorflow::Tensor> outputs;
+
+	is_training_tensor.scalar<bool>()() = false;
+
+	auto status = tf_session->Run(
+		{{"Placeholder", is_training_tensor}, {tensor_name, *inp_tensor}},
+		{"net_objectness_out"}, {}, &outputs);
+	assert(status.ok());
+
+	if (dpy) {
+		auto objs = getTFObjects(outputs[0], 0.5f);
+
+		for (auto it = objs.begin(); it != objs.end(); ++it) {
+			printf("x:%d, y:%d, conf:%.4f\n", it->x, it->y, it->confidence);
+		}
+	}
+}
+
 int main(int argc, char* argv[])
 {
-	if (argc <= 2) {
-		printf("cuvidapp [gpu_id] [file]\n");
+	if (argc <= 4) {
+		printf("cuvidapp [gpu_id] [file] [mode] [dpy]\n");
 		return 0;
 	}
 
 	gpu_id = atoi(argv[1]);
+	mode = static_cast<Mode>(atoi(argv[3]));
+	dpy = atoi(argv[4]);
 
 	cuInit(0);
 
@@ -436,6 +627,9 @@ int main(int argc, char* argv[])
 	res = cuCtxCreate(&cuda_ctx, CU_CTX_MAP_HOST, cuda_device);
 	MY_CHECK(res == CUDA_SUCCESS);
 
+	tensorflow::Status tf_status = initTF("car_cuvid.pb", gpu_id);
+	MY_CHECK(tf_status == tensorflow::Status::OK());
+
 	VideoDecoder decoder(argv[2], net_input_w, net_input_h);
 
 	struct timeval tv1;
@@ -443,13 +637,62 @@ int main(int argc, char* argv[])
 
 	int num_frames = 0;
 
+	cv::Mat tmp_mat, gray;
+
+	if (mode == ModeDirect) {
+		cuda_inp_allocator.reset(new CUVIDAllocator());
+		tensor_name = "input*0";
+	} else {
+		tensor_name = "input";
+	}
+
 	CUdeviceptr frame = 0;
 	unsigned int pitch = 0;
 
-	while ((frame = decoder.get_next_frame(0, pitch))) {
-		cv::Mat gray = decoder.device_frame_to_mat(frame, pitch, 0);
-		cv::imshow("frame", gray);
-		cv::waitKey(1);
+	CUstream stream = 0;
+
+	CUdeviceptr frame_cpy = 0;
+
+	if (mode == ModeDirect) {
+		stream = tf_cuda_stream;
+
+		res = cuMemAlloc(&frame_cpy, net_input_w * net_input_h);
+		assert(res == CUDA_SUCCESS);
+	}
+
+	while ((frame = decoder.get_next_frame(stream, pitch))) {
+		if (mode == ModeDirect) {
+			CUDA_MEMCPY2D m = { 0 };
+			m.srcMemoryType = CU_MEMORYTYPE_DEVICE;
+			m.srcDevice = frame;
+			m.srcPitch = pitch;
+			m.dstMemoryType = CU_MEMORYTYPE_DEVICE;
+			m.dstDevice = (CUdeviceptr)(m.dstHost = (void*)frame_cpy);
+			m.dstPitch = net_input_w;
+			m.WidthInBytes = net_input_w;
+			m.Height = net_input_h;
+			res = cuMemcpy2DAsync(&m, stream);
+			MY_CHECK(res == CUDA_SUCCESS);
+			cuda_inp_allocator->setPtr((void*)frame_cpy);
+			cuda_inp_tensor = tensorflow::Tensor(cuda_inp_allocator.get(), tensorflow::DataType::DT_UINT8, tensorflow::TensorShape({1, net_input_h, net_input_w, 1}));
+			feedTFFrame(tmp_mat);
+			if (dpy) {
+				gray = decoder.device_frame_to_mat(frame, pitch, stream);
+				cv::imshow("frame", gray);
+				cv::waitKey(1);
+			}
+		} else if (mode == ModeReadback) {
+			gray = decoder.device_frame_to_mat(frame, pitch, stream);
+			feedTFFrame(gray);
+			if (dpy) {
+				cv::imshow("frame", gray);
+				cv::waitKey(1);
+			}
+		} else if (dpy) {
+			gray = decoder.device_frame_to_mat(frame, pitch, stream);
+			cv::imshow("frame", gray);
+			cv::waitKey(1);
+		}
 		decoder.finish_frame(frame);
 		++num_frames;
 	}
