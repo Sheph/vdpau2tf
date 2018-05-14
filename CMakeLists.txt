@@ -72,3 +72,4 @@ include_directories(/usr/local)
 add_definitions(${Boost_LIB_DIAGNOSTIC_DEFINITIONS})
 
 add_subdirectory(vdapp)
+add_subdirectory(cuvidapp)
