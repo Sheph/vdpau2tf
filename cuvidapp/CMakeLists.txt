@@ -4,12 +4,13 @@ set(SOURCES
     Logger.h
     NvCodecUtils.h
     nvcuvid.h
+    Resize.cu
     main.cpp
 )
 
 set(CMAKE_INCLUDE_CURRENT_DIR ON)
 
-cuda_add_executable(cuvidapp ${SOURCES})
+cuda_add_executable(cuvidapp ${SOURCES} OPTIONS -std=c++11)
 
 target_link_libraries(cuvidapp ${OpenCV_LIBS} ${TF_LIBRARY} ${TF_FWK_LIBRARY} ${Boost_SYSTEM_LIBRARY} ${Boost_THREAD_LIBRARY} ${AVCODEC_LIBRARIES} ${AVFORMAT_LIBRARIES} ${AVUTIL_LIBRARIES} rt dl cuda nvcuvid)
 

@@ -162,7 +162,9 @@ class VideoDecoder
 {
 public:
 	VideoDecoder(const std::string& filename, int dest_width, int dest_height)
-	: dest_width_(dest_width),
+	: width_(0),
+	  height_(0),
+	  dest_width_(dest_width),
 	  dest_height_(dest_height),
 	  demuxer_(filename.c_str()),
 	  max_decode_surfaces_(0),
@@ -301,6 +303,9 @@ private:
 		;
 		this_->video_info_ << std::endl;
 
+		this_->width_ = pVideoFormat->coded_width;
+		this_->height_ = pVideoFormat->coded_height;
+
 		this_->max_decode_surfaces_ = 3;
 
 		CUVIDDECODECAPS decodecaps;
@@ -362,8 +367,8 @@ private:
 		videoDecodeCreateInfo.display_area.top = pVideoFormat->display_area.top;
 		videoDecodeCreateInfo.display_area.right = pVideoFormat->display_area.right;
 		videoDecodeCreateInfo.display_area.bottom = pVideoFormat->display_area.bottom;
-		videoDecodeCreateInfo.ulTargetWidth = this_->dest_width_;
-		videoDecodeCreateInfo.ulTargetHeight = this_->dest_height_;
+		videoDecodeCreateInfo.ulTargetWidth = pVideoFormat->coded_width;
+		videoDecodeCreateInfo.ulTargetHeight = pVideoFormat->coded_height;
 
 		this_->video_info_ << "Video Decoding Params:" << std::endl
 			<< "\tNum Surfaces : " << videoDecodeCreateInfo.ulNumDecodeSurfaces << std::endl
@@ -434,20 +439,9 @@ private:
 			bool copied = false;
 			for (size_t i = 0; i < this_->buffers_.size(); ++i) {
 				if (!this_->buffers_[i].used) {
-					CUDA_MEMCPY2D m = { 0 };
-					m.srcMemoryType = CU_MEMORYTYPE_DEVICE;
-					m.srcDevice = frame;
-					m.srcPitch = pitch;
-					m.dstMemoryType = CU_MEMORYTYPE_DEVICE;
-					m.dstDevice = (CUdeviceptr)(m.dstHost = (void*)this_->buffers_[i].frame);
-					m.dstPitch = this_->dest_width_;
-					m.WidthInBytes = this_->dest_width_;
-					m.Height = this_->dest_height_;
 					lock.unlock();
-					CUresult res = cuMemcpy2DAsync(&m, 0);
-					MY_CHECK(res == CUDA_SUCCESS);
-					res = cuStreamSynchronize(0);
-					MY_CHECK(res == CUDA_SUCCESS);
+					ResizeNv12((unsigned char *)this_->buffers_[i].frame, (int)this_->dest_width_, this_->dest_width_, this_->dest_height_,
+						(unsigned char *)frame, pitch, this_->width_, this_->height_);
 					lock.lock();
 					this_->buffers_[i].used = true;
 					this_->ordered_.push_back(i);
@@ -467,6 +461,9 @@ private:
 
 		return 1;
 	}
+
+	int width_;
+	int height_;
 
 	int dest_width_;
 	int dest_height_;
