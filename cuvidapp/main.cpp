@@ -402,8 +402,16 @@ private:
 
 		{
 			boost::mutex::scoped_lock lock(this_->mtx_);
-			while (static_cast<int>(this_->frame_queue_.size()) >= this_->max_decode_surfaces_) {
-				this_->cond_.wait(lock);
+			bool found = true;
+			while (found) {
+				found = false;
+				for (auto it = this_->frame_queue_.begin(); it != this_->frame_queue_.end(); ++it) {
+					if ((*it)->picture_index == pPicParams->CurrPicIdx) {
+						this_->cond_.wait(lock);
+						found = true;
+						break;
+					}
+				}
 			}
 		}
 
