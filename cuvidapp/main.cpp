@@ -64,6 +64,9 @@ static const int net_grid_h = 9;
 
 static const int net_batch_size = 10;
 
+static bool decoder_sync = true;
+static int drop_count = 0;
+
 static const char * GetVideoCodecString(cudaVideoCodec eCodec) {
 	static struct {
 		cudaVideoCodec eCodec;
@@ -151,13 +154,8 @@ simplelogger::Logger *logger = simplelogger::LoggerFactory::CreateConsoleLogger(
 
 struct VideoBuffer
 {
-	VideoBuffer() {}
-	explicit VideoBuffer(CUVIDPARSERDISPINFO* disp_info)
-	: disp_info(disp_info) {}
-
-	CUVIDPARSERDISPINFO* disp_info;
 	CUdeviceptr frame;
-	unsigned int pitch;
+	bool used = false;
 };
 
 class VideoDecoder
@@ -187,6 +185,14 @@ public:
 		res = cuvidCreateVideoParser(&parser_, &videoParserParameters);
 		MY_CHECK(res == CUDA_SUCCESS);
 
+		buffers_.resize(17);
+
+		for (size_t i = 0; i < buffers_.size(); ++i) {
+			res = cuMemAlloc(&buffers_[i].frame, dest_width_ * dest_height_);
+			assert(res == CUDA_SUCCESS);
+			buffers_[i].used = false;
+		}
+
 		thr_ = boost::thread(boost::bind(&VideoDecoder::decode_thread_fn, this));
 	}
 
@@ -199,51 +205,31 @@ public:
 	{
 		buffers.clear();
 
-		{
-			boost::mutex::scoped_lock lock(mtx_);
-			while (frame_queue_.empty() && !done_) {
-				cond_.wait(lock);
-			}
-			if (done_) {
-				return;
-			}
-
-			for (auto it = frame_queue_.begin(); (it != frame_queue_.end()) && (static_cast<int>(buffers.size()) < net_batch_size); ++it) {
-				buffers.push_back(VideoBuffer(*it));
-			}
+		boost::mutex::scoped_lock lock(mtx_);
+		while (ordered_.empty() && !done_) {
+			cond_.wait(lock);
 		}
 
-		for (auto it = buffers.begin(); it != buffers.end(); ++it) {
-			CUVIDPARSERDISPINFO* disp_info = it->disp_info;
+		if (done_) {
+			return;
+		}
 
-			CUVIDPROCPARAMS videoProcessingParameters = {};
-			videoProcessingParameters.progressive_frame = disp_info->progressive_frame;
-			videoProcessingParameters.second_field = disp_info->repeat_first_field + 1;
-			videoProcessingParameters.top_field_first = disp_info->top_field_first;
-			videoProcessingParameters.unpaired_field = disp_info->repeat_first_field < 0;
-			videoProcessingParameters.output_stream = stream;
-
-			CUresult res = cuvidMapVideoFrame(decoder_, disp_info->picture_index, &it->frame,
-				&it->pitch, &videoProcessingParameters);
-			MY_CHECK(res == CUDA_SUCCESS);
+		for (auto it = ordered_.begin(); (it != ordered_.end()) && (buffers.size() < net_batch_size); ++it) {
+			buffers.push_back(buffers_[*it]);
 		}
 	}
 
 	void finish_frames(const std::vector<VideoBuffer>& buffers)
 	{
-		for (auto it = buffers.begin(); it != buffers.end(); ++it) {
-			CUresult res = cuvidUnmapVideoFrame(decoder_, it->frame);
-			MY_CHECK(res == CUDA_SUCCESS);
-		}
-
 		boost::mutex::scoped_lock lock(mtx_);
 		for (auto it = buffers.begin(); it != buffers.end(); ++it) {
-			frame_queue_.pop_front();
+			buffers_[ordered_.front()].used = false;
+			ordered_.pop_front();
 		}
 		cond_.notify_all();
 	}
 
-	cv::Mat device_frame_to_mat(CUdeviceptr frame, unsigned int pitch, CUstream stream)
+	cv::Mat device_frame_to_mat(CUdeviceptr frame)
 	{
 		MY_CHECK(bit_depth_minus_8_ == 0);
 
@@ -252,15 +238,15 @@ public:
 		CUDA_MEMCPY2D m = { 0 };
 		m.srcMemoryType = CU_MEMORYTYPE_DEVICE;
 		m.srcDevice = frame;
-		m.srcPitch = pitch;
+		m.srcPitch = dest_width_;
 		m.dstMemoryType = CU_MEMORYTYPE_HOST;
 		m.dstDevice = (CUdeviceptr)(m.dstHost = gray.data);
 		m.dstPitch = dest_width_;
 		m.WidthInBytes = dest_width_;
 		m.Height = dest_height_;
-		CUresult res = cuMemcpy2DAsync(&m, stream);
+		CUresult res = cuMemcpy2DAsync(&m, 0);
 		MY_CHECK(res == CUDA_SUCCESS);
-		res = cuStreamSynchronize(stream);
+		res = cuStreamSynchronize(0);
 		MY_CHECK(res == CUDA_SUCCESS);
 
 		return gray;
@@ -299,7 +285,7 @@ private:
 		VideoDecoder* this_ = (VideoDecoder*)pUserData;
 
 		if (this_->decoder_) {
-			return 1;
+			return this_->max_decode_surfaces_;
 		}
 
 		this_->video_info_ << "Video Input Information" << std::endl
@@ -315,7 +301,7 @@ private:
 		;
 		this_->video_info_ << std::endl;
 
-		this_->max_decode_surfaces_ = GetNumDecodeSurfaces(pVideoFormat->codec, pVideoFormat->coded_width, pVideoFormat->coded_height);
+		this_->max_decode_surfaces_ = 3;
 
 		CUVIDDECODECAPS decodecaps;
 		memset(&decodecaps, 0, sizeof(decodecaps));
@@ -364,7 +350,7 @@ private:
 		videoDecodeCreateInfo.OutputFormat = pVideoFormat->bit_depth_luma_minus8 ? cudaVideoSurfaceFormat_P016 : cudaVideoSurfaceFormat_NV12;
 		videoDecodeCreateInfo.bitDepthMinus8 = pVideoFormat->bit_depth_luma_minus8;
 		videoDecodeCreateInfo.DeinterlaceMode = cudaVideoDeinterlaceMode_Weave;
-		videoDecodeCreateInfo.ulNumOutputSurfaces = net_batch_size;
+		videoDecodeCreateInfo.ulNumOutputSurfaces = 1;
 		// With PreferCUVID, JPEG is still decoded by CUDA while video is decoded by NVDEC hardware
 		videoDecodeCreateInfo.ulCreationFlags = cudaVideoCreate_PreferCUVID;
 		videoDecodeCreateInfo.ulNumDecodeSurfaces = this_->max_decode_surfaces_;
@@ -400,17 +386,19 @@ private:
 	{
 		VideoDecoder* this_ = (VideoDecoder*)pUserData;
 
-		{
+		if (decoder_sync) {
 			boost::mutex::scoped_lock lock(this_->mtx_);
-			bool found = true;
-			while (found) {
-				found = false;
-				for (auto it = this_->frame_queue_.begin(); it != this_->frame_queue_.end(); ++it) {
-					if ((*it)->picture_index == pPicParams->CurrPicIdx) {
-						this_->cond_.wait(lock);
-						found = true;
-						break;
+			while (true) {
+				int num_unused = 0;
+				for (size_t i = 0; i < this_->buffers_.size(); ++i) {
+					if (!this_->buffers_[i].used) {
+						++num_unused;
 					}
+				}
+				if (num_unused < this_->max_decode_surfaces_) {
+					this_->cond_.wait(lock);
+				} else {
+					break;
 				}
 			}
 		}
@@ -427,9 +415,55 @@ private:
 
 		MY_CHECK(pDispInfo->picture_index < this_->max_decode_surfaces_);
 
-		boost::mutex::scoped_lock lock(this_->mtx_);
-		this_->frame_queue_.push_back(pDispInfo);
-		this_->cond_.notify_all();
+		CUVIDPROCPARAMS videoProcessingParameters = {};
+		videoProcessingParameters.progressive_frame = pDispInfo->progressive_frame;
+		videoProcessingParameters.second_field = pDispInfo->repeat_first_field + 1;
+		videoProcessingParameters.top_field_first = pDispInfo->top_field_first;
+		videoProcessingParameters.unpaired_field = pDispInfo->repeat_first_field < 0;
+		videoProcessingParameters.output_stream = 0;
+
+		CUdeviceptr frame;
+		unsigned int pitch;
+
+		CUresult res = cuvidMapVideoFrame(this_->decoder_, pDispInfo->picture_index, &frame,
+			&pitch, &videoProcessingParameters);
+		MY_CHECK(res == CUDA_SUCCESS);
+
+		{
+			boost::mutex::scoped_lock lock(this_->mtx_);
+			bool copied = false;
+			for (size_t i = 0; i < this_->buffers_.size(); ++i) {
+				if (!this_->buffers_[i].used) {
+					CUDA_MEMCPY2D m = { 0 };
+					m.srcMemoryType = CU_MEMORYTYPE_DEVICE;
+					m.srcDevice = frame;
+					m.srcPitch = pitch;
+					m.dstMemoryType = CU_MEMORYTYPE_DEVICE;
+					m.dstDevice = (CUdeviceptr)(m.dstHost = (void*)this_->buffers_[i].frame);
+					m.dstPitch = this_->dest_width_;
+					m.WidthInBytes = this_->dest_width_;
+					m.Height = this_->dest_height_;
+					lock.unlock();
+					CUresult res = cuMemcpy2DAsync(&m, 0);
+					MY_CHECK(res == CUDA_SUCCESS);
+					res = cuStreamSynchronize(0);
+					MY_CHECK(res == CUDA_SUCCESS);
+					lock.lock();
+					this_->buffers_[i].used = true;
+					this_->ordered_.push_back(i);
+					copied = true;
+					break;
+				}
+			}
+			MY_CHECK(!decoder_sync || copied);
+			if (!copied) {
+				++drop_count;
+			}
+			this_->cond_.notify_all();
+		}
+
+		res = cuvidUnmapVideoFrame(this_->decoder_, frame);
+		MY_CHECK(res == CUDA_SUCCESS);
 
 		return 1;
 	}
@@ -450,7 +484,8 @@ private:
 	int max_decode_surfaces_;
 	int bit_depth_minus_8_;
 	CUvideodecoder decoder_;
-	std::list<CUVIDPARSERDISPINFO*> frame_queue_;
+	std::vector<VideoBuffer> buffers_;
+	std::list<int> ordered_;
 	bool done_;
 };
 
@@ -685,7 +720,7 @@ int main(int argc, char* argv[])
 				CUDA_MEMCPY2D m = { 0 };
 				m.srcMemoryType = CU_MEMORYTYPE_DEVICE;
 				m.srcDevice = buffers[i].frame;
-				m.srcPitch = buffers[i].pitch;
+				m.srcPitch = net_input_w;
 				m.dstMemoryType = CU_MEMORYTYPE_DEVICE;
 				m.dstDevice = (CUdeviceptr)(m.dstHost = (char*)batch + net_input_w * net_input_h * i);
 				m.dstPitch = net_input_w;
@@ -698,7 +733,7 @@ int main(int argc, char* argv[])
 			cuda_inp_tensor = tensorflow::Tensor(cuda_inp_allocator.get(), tensorflow::DataType::DT_UINT8, tensorflow::TensorShape({static_cast<int>(buffers.size()), net_input_h, net_input_w, 1}));
 			feedTFFrame(cuda_inp_tensor);
 			if (dpy) {
-				gray = decoder.device_frame_to_mat(buffers[0].frame, buffers[0].pitch, stream);
+				gray = decoder.device_frame_to_mat(buffers[0].frame);
 				cv::imshow("frame", gray);
 				cv::waitKey(1);
 			}
@@ -707,7 +742,7 @@ int main(int argc, char* argv[])
 				tensorflow::TensorShape({static_cast<int>(buffers.size()), net_input_h, net_input_w, 1}));
 			unsigned char* inp_data = batch_tensor.flat<unsigned char>().data();
 			for (size_t i = 0; i < buffers.size(); ++i) {
-				gray = decoder.device_frame_to_mat(buffers[i].frame, buffers[i].pitch, stream);
+				gray = decoder.device_frame_to_mat(buffers[i].frame);
 				memcpy(inp_data + net_input_w * net_input_h * i, gray.data, net_input_w * net_input_h);
 			}
 			feedTFFrame(batch_tensor);
@@ -716,7 +751,7 @@ int main(int argc, char* argv[])
 				cv::waitKey(1);
 			}
 		} else if (dpy) {
-			gray = decoder.device_frame_to_mat(buffers[0].frame, buffers[0].pitch, stream);
+			gray = decoder.device_frame_to_mat(buffers[0].frame);
 			cv::imshow("frame", gray);
 			cv::waitKey(1);
 		}
@@ -731,7 +766,7 @@ int main(int argc, char* argv[])
 
 	double tm = (double)tv_res.tv_sec + (double)tv_res.tv_usec / 1000000.0;
 
-	printf("DONE %f fps!\n", (float)(num_frames / tm));
+	printf("DONE %f fps, dropped = %d!\n", (float)(num_frames / tm), drop_count);
 
 	fflush(stdout);
 
