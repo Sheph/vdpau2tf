@@ -672,7 +672,7 @@ int main(int argc, char* argv[])
 	CUresult res = cuDeviceGet(&cuda_device, gpu_id);
 	MY_CHECK(res == CUDA_SUCCESS);
 
-	res = cuCtxCreate(&cuda_ctx, CU_CTX_MAP_HOST, cuda_device);
+	res = cuDevicePrimaryCtxRetain(&cuda_ctx, cuda_device);
 	MY_CHECK(res == CUDA_SUCCESS);
 
 	tensorflow::Status tf_status = initTF("car_cuvid.pb", gpu_id);
