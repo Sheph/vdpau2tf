@@ -154,8 +154,7 @@ simplelogger::Logger *logger = simplelogger::LoggerFactory::CreateConsoleLogger(
 
 struct VideoBuffer
 {
-	CUdeviceptr frame;
-	bool used = false;
+	CUdeviceptr frame = 0;
 };
 
 class VideoDecoder
@@ -189,12 +188,6 @@ public:
 
 		buffers_.resize(17);
 
-		for (size_t i = 0; i < buffers_.size(); ++i) {
-			res = cuMemAlloc(&buffers_[i].frame, dest_width_ * dest_height_);
-			assert(res == CUDA_SUCCESS);
-			buffers_[i].used = false;
-		}
-
 		thr_ = boost::thread(boost::bind(&VideoDecoder::decode_thread_fn, this));
 	}
 
@@ -225,7 +218,8 @@ public:
 	{
 		boost::mutex::scoped_lock lock(mtx_);
 		for (auto it = buffers.begin(); it != buffers.end(); ++it) {
-			buffers_[ordered_.front()].used = false;
+			cuMemFree(buffers_[ordered_.front()].frame);
+			buffers_[ordered_.front()].frame = 0;
 			ordered_.pop_front();
 		}
 		cond_.notify_all();
@@ -396,7 +390,7 @@ private:
 			while (true) {
 				int num_unused = 0;
 				for (size_t i = 0; i < this_->buffers_.size(); ++i) {
-					if (!this_->buffers_[i].used) {
+					if (!this_->buffers_[i].frame) {
 						++num_unused;
 					}
 				}
@@ -438,12 +432,13 @@ private:
 			boost::mutex::scoped_lock lock(this_->mtx_);
 			bool copied = false;
 			for (size_t i = 0; i < this_->buffers_.size(); ++i) {
-				if (!this_->buffers_[i].used) {
+				if (!this_->buffers_[i].frame) {
+					res = cuMemAlloc(&this_->buffers_[i].frame, this_->dest_width_ * this_->dest_height_);
+					MY_CHECK(res == CUDA_SUCCESS);
 					lock.unlock();
 					ResizeNv12((unsigned char *)this_->buffers_[i].frame, (int)this_->dest_width_, this_->dest_width_, this_->dest_height_,
 						(unsigned char *)frame, pitch, this_->width_, this_->height_);
 					lock.lock();
-					this_->buffers_[i].used = true;
 					this_->ordered_.push_back(i);
 					copied = true;
 					break;
