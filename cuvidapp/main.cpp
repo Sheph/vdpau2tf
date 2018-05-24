@@ -5,6 +5,7 @@ extern "C" {
 }
 
 #include <cuda.h>
+#include <nvml.h>
 #include "nvcuvid.h"
 #include "FFmpegDemuxer.h"
 
@@ -662,6 +663,19 @@ int main(int argc, char* argv[])
 	mode = static_cast<Mode>(atoi(argv[3]));
 	dpy = atoi(argv[4]);
 
+	nvmlReturn_t nvml_res = nvmlInit();
+	MY_CHECK(nvml_res == NVML_SUCCESS);
+
+	unsigned int dev_count = 0;
+
+	nvml_res = nvmlDeviceGetCount(&dev_count);
+	MY_CHECK(nvml_res == NVML_SUCCESS);
+
+	nvmlDevice_t nvml_dev = NULL;
+
+	nvml_res = nvmlDeviceGetHandleByIndex(gpu_id, &nvml_dev);
+	MY_CHECK(nvml_res == NVML_SUCCESS);
+
 	cuInit(0);
 
 	CUresult res = cuDeviceGet(&cuda_device, gpu_id);
@@ -702,7 +716,23 @@ int main(int argc, char* argv[])
 		assert(res == CUDA_SUCCESS);
 	}
 
+	struct timeval dec_t1;
+	gettimeofday(&dec_t1, NULL);
+
 	while (true) {
+		struct timeval dec_t2, dec_tres;
+		gettimeofday(&dec_t2, NULL);
+		timersub(&dec_t2, &dec_t1, &dec_tres);
+
+		if ((dec_tres.tv_sec * 1000000 + dec_tres.tv_usec) >= 2000000) {
+			uint32_t dec_util = 0;
+			uint32_t dec_period_us = 0;
+			nvml_res = nvmlDeviceGetDecoderUtilization(nvml_dev, &dec_util, &dec_period_us);
+			MY_CHECK(nvml_res == NVML_SUCCESS);
+			printf("dec = %d%%, dt = %dus\n", dec_util, dec_period_us);
+			dec_t1 = dec_t2;
+		}
+
 		decoder.get_frames(stream, buffers);
 		if (buffers.empty()) {
 			break;

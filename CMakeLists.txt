@@ -42,6 +42,7 @@ find_path(VDPAU_INCLUDE_DIR NAMES vdpau/vdpau.h vdpau/vdpau_x11.h PATHS ${VDPAU_
 find_library(VDPAU_LIBRARY NAMES vdpau PATHS ${VDPAU_LIBDIR})
 find_library(TF_LIBRARY NAMES tensorflow_cc HINTS "${TF_DIR}/bazel-bin/tensorflow" NO_DEFAULT_PATH NO_CMAKE_FIND_ROOT_PATH)
 find_library(TF_FWK_LIBRARY NAMES tensorflow_framework HINTS "${TF_DIR}/bazel-bin/tensorflow" NO_DEFAULT_PATH NO_CMAKE_FIND_ROOT_PATH)
+find_library(NVIDIA_ML_LIBRARY NAMES nvidia-ml PATHS "/usr/lib/nvidia-387")
 
 set(VDPAU_LIBRARIES ${VDPAU_LIBRARY})
 
